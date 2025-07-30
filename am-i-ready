@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# Minimum required versions (edit these; leave blank to skip a tool)
+###############################################################################
+: "${REQUIRED_NODE:=18.16.0}"
+: "${REQUIRED_NPM:=10.7.0}"
+: "${REQUIRED_DOCKER:=}"     # e.g., 26.0.0
+: "${REQUIRED_PYTHON3:=}"    # e.g., 3.10.0
+
+# Optional: make discovery non-interactive in CI by setting these to 1.
+: "${AUTO_SEARCH:=0}"  # 1 = search common locations without prompting
+: "${AUTO_YES:=0}"     # 1 = auto-choose first match when multiple are found
+
+###############################################################################
+# Utilities
+###############################################################################
+is_tty()  { [[ -t 0 ]] && [[ -t 1 ]]; }
+trim_cr() { tr -d '\r'; }  # handle CRLF in Git Bash output
+
+color() { # color <code> <text> (green=32, red=31, yellow=33, blue=34)
+  if [[ -t 1 ]]; then printf "\033[%sm%s\033[0m" "$1" "$2"; else printf "%s" "$2"; fi
+}
+info() {  printf "ℹ️  %s\n" "$(color 34 "$*")"; }
+ok()   {  printf "✅  %s\n" "$(color 32 "$*")"; }
+warn() {  printf "⚠️  %s\n" "$(color 33 "$*")"; }
+fail() {  printf "❌  %s\n" "$(color 31 "$*")" >&2; }
+
+# Extract first semver-ish token from arbitrary text (handles "Docker version 27.0.3, build ...")
+first_semver_in() { grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -n1; }
+
+# Remove leading 'v' & any prerelease/build suffix (v20.12.0-rc.1 → 20.12.0)
+strip_meta() { echo "$1" | sed -e 's/^[vV]//' -e 's/[^0-9.].*$//'; }
+
+# Numeric piecewise compare: return 0 if $1 >= $2 else 1
+version_ge() {
+  local A B IFS=.
+  read -r -a A <<<"$(strip_meta "$1")"
+  read -r -a B <<<"$(strip_meta "$2")"
+  local len=$(( ${#A[@]} > ${#B[@]} ? ${#A[@]} : ${#B[@]} ))
+  for ((i=0;i<len;i++)); do
+    local ai=${A[i]:-0} bi=${B[i]:-0}
+    if ((10#$ai > 10#$bi)); then return 0; fi
+    if ((10#$ai < 10#$bi)); then return 1; fi
+  done
+  return 0
+}
+
+ask_yes_no() {
+  local q="$1" default_yes="${2:-1}" ans
+  if (( AUTO_YES )); then return 0; fi
+  if ! is_tty && ! (( AUTO_SEARCH )); then return 1; fi
+  local suffix="[Y/n]"; (( default_yes )) || suffix="[y/N]"
+  read -r -p "$q $suffix " ans || true
+  ans="$(echo "${ans:-}" | awk '{print tolower($0)}')"
+  if [[ -z "$ans" ]]; then
+    (( default_yes )) && return 0 || return 1
+  fi
+  [[ "$ans" == y || "$ans" == yes ]] && return 0 || return 1
+}
+
+prepend_path() {
+  local dir="$1"
+  case ":$PATH:" in *":$dir:"*) : ;; *) PATH="$dir:$PATH";; esac
+  export PATH
+}
+
+detect_os() {
+  local u; u="$(uname -s 2>/dev/null || echo unknown)"
+  case "$u" in
+    Darwin) echo mac ;;
+    Linux)  echo linux ;;
+    CYGWIN*|MINGW*|MSYS*) echo winbash ;;
+    *) echo other ;;
+  esac
+}
+
+build_search_dirs() {
+  local os; os="$(detect_os)"
+  local home="${HOME:-}"
+  local dirs=()
+
+  # Common unix-like
+  dirs+=(/usr/local/bin /usr/bin)
+
+  if [[ "$os" == mac ]]; then
+    dirs+=(/opt/homebrew/bin /usr/local/bin)
+    [[ -n "$home" ]] && dirs+=("$home/.volta/bin" "$home/.nvm/versions/node"/*/bin "$home/.asdf/shims" "$home/.asdf/installs/nodejs"/*/bin)
+  elif [[ "$os" == linux ]]; then
+    dirs+=(/snap/bin /usr/local/sbin /usr/sbin)
+    [[ -n "$home" ]] && dirs+=("$home/.volta/bin" "$home/.nvm/versions/node"/*/bin "$home/.asdf/shims" "$home/.asdf/installs/nodejs"/*/bin /usr/local/n/versions/*/bin)
+  elif [[ "$os" == winbash ]]; then
+    # Typical Windows locations via MSYS paths
+    dirs+=(/c/Program\ Files/nodejs /c/Program\ Files\ \(x86\)/nodejs)
+    dirs+=(/c/Program\ Files/Docker/Docker/resources/bin)
+    if [[ -n "${USERPROFILE:-}" ]]; then
+      local up="/c/$(echo "$USERPROFILE" | sed 's#^[A-Za-z]:\\##; s#\\#/#g')"
+      dirs+=("$up/AppData/Roaming/nvm"/* "$up/AppData/Local/Volta/bin")
+      dirs+=("$up/AppData/Local/Programs/Python"/* "$up/AppData/Local/Microsoft/WindowsApps")
+    fi
+    dirs+=(/mingw64/bin /usr/bin)
+  fi
+
+  # De-duplicate & keep existing
+  local out=() seen=""
+  for d in "${dirs[@]}"; do
+    for g in $d; do
+      [[ -d "$g" ]] || continue
+      case ":$seen:" in *":$g:"*) ;; *) out+=("$g"); seen="$seen:$g";; esac
+    done
+  done
+  printf '%s\n' "${out[@]}"
+}
+
+find_exe_candidates() {
+  local name="$1"; shift
+  local -a roots=("$@")
+  local c=()
+  for r in "${roots[@]}"; do
+    [[ -d "$r" ]] || continue
+    for exe in "$r/$name" "$r/$name.exe" "$r/$name.cmd"; do
+      [[ -f "$exe" && -x "$exe" ]] && c+=("$exe")
+    done
+  done
+  printf '%s\n' "${c[@]:-}"
+}
+
+choose_candidate() {
+  local what="$1"; shift
+  mapfile -t cands < <(printf '%s\n' "$@")
+  local n="${#cands[@]}"
+  (( n == 0 )) && return 1
+  if (( n == 1 )); then printf '%s\n' "${cands[0]}"; return 0; fi
+  echo "Multiple $what locations found:"
+  local i; for ((i=0;i<n;i++)); do printf "  [%d] %s\n" "$((i+1))" "${cands[$i]}"; done
+  local pick
+  if (( AUTO_YES )); then pick=1
+  elif is_tty; then read -r -p "Choose 1-$n [1]: " pick; pick="${pick:-1}"
+  else pick=1; fi
+  if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=n )); then
+    printf '%s\n' "${cands[$((pick-1))]}"
+    return 0
+  fi
+  return 1
+}
+
+ensure_tool() {
+  # ensure_tool <binary-name> <friendly-display-name>
+  local name="$1" friendly="$2"
+  if command -v "$name" >/dev/null 2>&1; then return 0; fi
+
+  if ask_yes_no "❓  $friendly not found on PATH. Search common install locations?" 1 || (( AUTO_SEARCH )); then
+    mapfile -t dirs < <(build_search_dirs)
+    mapfile -t cands < <(find_exe_candidates "$name" "${dirs[@]}")
+    if chosen="$(choose_candidate "$friendly" "${cands[@]}")"; then
+      prepend_path "$(dirname "$chosen")"
+      command -v "$name" >/dev/null 2>&1 && return 0
+    fi
+  fi
+
+  fail "$friendly not found."
+  return 1
+}
+
+###############################################################################
+# Generic “versioned tool” checker
+# Usage: require_tool_semver "<Friendly>" <bin> "<required_semver>" "<version_command>"
+###############################################################################
+require_tool_semver() {
+  local friendly="$1" bin="$2" required="$3" vcmd="$4"
+  [[ -z "$required" ]] && { info "Skipping $friendly (no required version set)."; return 0; }
+
+  ensure_tool "$bin" "$friendly" || return 1
+
+  local raw out
+  if ! raw="$(eval "$vcmd" 2>/dev/null | trim_cr)"; then
+    fail "Failed to run version command for $friendly: $vcmd"
+    return 1
+  fi
+
+  out="$(echo "$raw" | first_semver_in)"
+  [[ -z "$out" ]] && out="$(strip_meta "$raw")"
+  if [[ ! "$out" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    fail "Could not parse $friendly version from: $raw"
+    return 1
+  fi
+
+  if version_ge "$out" "$required"; then
+    ok "$friendly $raw (meets ≥ $required)"
+  else
+    fail "$friendly $raw is too old — need ≥ $required"
+    return 1
+  fi
+}
+
+###############################################################################
+# Tool-specific wrappers (easy to add more later)
+###############################################################################
+require_node()   { require_tool_semver "Node.js" node   "$REQUIRED_NODE"   "node -v"; }
+require_npm()    { require_tool_semver "npm"    npm     "$REQUIRED_NPM"    "npm -v"; }
+require_docker() { require_tool_semver "Docker" docker  "$REQUIRED_DOCKER" "docker --version"; }
+
+# Python tries python3, then python, then Windows "py -3"
+require_python3() {
+  [[ -z "$REQUIRED_PYTHON3" ]] && { info "Skipping Python (no required version set)."; return 0; }
+
+  local cmd raw ver
+  if command -v python3 >/dev/null 2>&1; then cmd="python3"
+  elif command -v python  >/dev/null 2>&1; then cmd="python"
+  elif command -v py      >/dev/null 2>&1; then cmd="py -3"
+  else
+    ensure_tool python3 "Python 3" || { fail "Python 3 not found."; return 1; }
+    cmd="python3"
+  fi
+
+  if ! raw="$($cmd -V 2>&1 | trim_cr)"; then
+    fail "Failed to run: $cmd -V"
+    return 1
+  fi
+  ver="$(echo "$raw" | first_semver_in)"
+  [[ -z "$ver" ]] && { fail "Could not parse Python version from: $raw"; return 1; }
+
+  if version_ge "$ver" "$REQUIRED_PYTHON3"; then
+    ok "Python $raw (via '$cmd', meets ≥ $REQUIRED_PYTHON3)"
+  else
+    fail "Python $raw is too old — need ≥ $REQUIRED_PYTHON3"
+    return 1
+  fi
+}
+
+###############################################################################
+# Profiles (grow these over time)
+###############################################################################
+checkFrontendInterviewRequirements() {
+  local ok_all=1
+  require_node   || ok_all=0
+  require_npm    || ok_all=0
+  # Add more FE tools later (e.g., require_tool_semver "Yarn" yarn "$REQUIRED_YARN" "yarn -v")
+  (( ok_all )) && ok "Frontend interview requirements satisfied." || fail "Frontend interview requirements NOT satisfied."
+  return $(( ok_all ? 0 : 1 ))
+}
+
+checkBackendInterviewRequirements() {
+  local ok_all=1
+  require_node    || ok_all=0
+  require_npm     || ok_all=0
+  require_docker  || ok_all=0
+  require_python3 || ok_all=0
+  # Add more BE tools later (Go, Postgres client, etc.)
+  (( ok_all )) && ok "Backend interview requirements satisfied." || fail "Backend interview requirements NOT satisfied."
+  return $(( ok_all ? 0 : 1 ))
+}
+
+###############################################################################
+# Run checks (comment/uncomment as you like — no command-line args)
+###############################################################################
+overall_rc=0
+
+# FRONTEND — enabled by default
+checkFrontendInterviewRequirements || overall_rc=1
+
+# BACKEND — comment out to disable (left disabled per your note)
+# checkBackendInterviewRequirements || overall_rc=1
+
+exit "$overall_rc"

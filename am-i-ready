@@ -6,6 +6,7 @@ set -euo pipefail
 ###############################################################################
 : "${REQUIRED_NODE:=18.16.0}"
 : "${REQUIRED_NPM:=10.7.0}"
+: "${REQUIRED_GIT:=2.30.0}"     # git is required for all interviews
 : "${REQUIRED_DOCKER:=}"     # e.g., 26.0.0
 : "${REQUIRED_PYTHON3:=}"    # e.g., 3.10.0
 
@@ -199,6 +200,7 @@ require_tool_semver() {
 ###############################################################################
 require_node()   { require_tool_semver "Node.js" node   "$REQUIRED_NODE"   "node -v"; }
 require_npm()    { require_tool_semver "npm"    npm     "$REQUIRED_NPM"    "npm -v"; }
+require_git()    { require_tool_semver "Git"    git     "$REQUIRED_GIT"    "git --version"; }
 require_docker() { require_tool_semver "Docker" docker  "$REQUIRED_DOCKER" "docker --version"; }
 
 # Python tries python3, then python, then Windows "py -3"
@@ -234,6 +236,7 @@ require_python3() {
 ###############################################################################
 checkFrontendInterviewRequirements() {
   local ok_all=1
+  require_git    || ok_all=0
   require_node   || ok_all=0
   require_npm    || ok_all=0
   # Add more FE tools later (e.g., require_tool_semver "Yarn" yarn "$REQUIRED_YARN" "yarn -v")
@@ -243,6 +246,7 @@ checkFrontendInterviewRequirements() {
 
 checkBackendInterviewRequirements() {
   local ok_all=1
+  require_git     || ok_all=0
   require_node    || ok_all=0
   require_npm     || ok_all=0
   require_docker  || ok_all=0
